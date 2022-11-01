@@ -1,0 +1,246 @@
+---
+title: "RACE catch"
+author: "Alberto Rovellini"
+date: "4/21/2021"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+This document reads in Catch data from AKFIN Answers for all species in the GOA, and calculates the CPUE for each species in each haul based on the Haul Description data set from AKFIN. The reason this document exists is that CPUE data from AKFIN includes information on a subset of 121 species in the RACE data set (mainly groundfish and other commercial species), while we need CPUE for all invertebrate groups as well. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(kableExtra)
+library(sf)
+library(raster)
+library(viridis)
+library(rnaturalearth)
+```
+
+```{r}
+select <- dplyr::select
+```
+
+Read in Atlantis groups, the RACE species list, and map them to one another.
+```{r}
+atlantis_groups <- read.csv("../data/GOA_Groups.csv", fileEncoding = "UTF-8-BOM")
+atlantis_groups <- atlantis_groups %>% select(Code, Name, LongName)
+
+race_species_all <- read.csv("../data/RACE_species_goa_Atlantis.csv", fileEncoding = "UTF-8-BOM")
+race_species <- race_species_all[!is.na(race_species_all$Atlantis.group),] # drop NAs (egg cases, debris, etc.)
+race_species <- race_species %>% select(Atlantis.group:Scientific.Name)
+
+race_species <- race_species %>% left_join(atlantis_groups, by = c("Atlantis.group" = "Code"))
+```
+
+Read in AKFIN "Catch" data.
+```{r}
+catch <- read.csv("../data/race_catch_by_haul.csv", skip = 5)
+
+# how many species do we have catch data for, from AKFIN?
+length(levels(factor(catch$Species.Code))) # 1531
+
+# and how many hauls?
+length(levels(factor(catch$Haul.Join.ID))) # 12288
+```
+
+The Catch data does not include information about the effort. So let's use the "Haul Description" data set to obtain haul information. The column "Satisfactory Performance" will be used to subset these to the hauls that can be used.
+```{r}
+hauls <- read.csv("../data/Haul Descriptions.csv", fileEncoding = "UTF-8-BOM")
+hauls <- hauls %>% 
+  select(Haul.Join.ID, Distance.Fished..km., Net.Width..m., Satisfactory.Performance) %>%
+  filter(Satisfactory.Performance == "Y") %>% 
+  mutate(My.effort.km2 = Distance.Fished..km.* Net.Width..m. * 0.001) %>%
+  select(Haul.Join.ID, My.effort.km2)
+```
+
+These are a few hundreds fewer than the number of hauls in the Catch data. That seems to be because the Catch data includes hauls where the gear performance was not satisfactory, but still have caught something. Those would be good enough for presence/absence, but we should leave them out for any CPUE calculation.
+
+Now join the haul data to the catch data by Haul.Join.ID. Because now the haul data only contains the hauls we can use for effort/CPUE, base the join on that. Drop columns as appropriate. Then calculate new CPUE for weight and numbers from this. 
+```{r}
+catch_short <- catch %>% select(Year, Haul.Join.ID, Catch.Join.ID, Starting.Latitude..dd., Starting.Longitude..dd., Bottom.Depth, Species.Code, Weight..kg., Number.of.Fish)
+
+catch_all <- hauls %>% left_join(catch_short) %>% mutate(cpue.kg.km2 = Weight..kg./My.effort.km2, cpue.ind.km2 = Number.of.Fish/My.effort.km2) %>%
+  select(Year, Haul.Join.ID, Catch.Join.ID, Starting.Latitude..dd., Starting.Longitude..dd., Bottom.Depth, Species.Code, cpue.kg.km2, cpue.ind.km2)
+```
+However, some hauls in the haul data do not appear in the catch data. Discard those hauls that do not have information in the catch data. In addition, some records have no CPUE, biomass or numbers. Discard those too.
+
+```{r}
+catch_all <- catch_all %>% filter(!is.na(Starting.Latitude..dd.) & !is.na(cpue.kg.km2))
+```
+
+# Lenght frequency and catch
+
+Before we expand the zeroes in the Catch data, let's have a look at what is going on in the length data. Is length-frequency information collected for every single tow, or is it a subset? And how large is this subset? What does it depend on? And what about CPUE data? Are those also different hauls? CPUE data is padded with zeroes for zero hauls, so we cannot use that. Focus on catch data.
+
+From von Szalay and Raring (2016): 
+
+*Additional biological information was collected from species of commercial value, ecological importance, or abundance in the survey area. A random subsample of 100-300 individuals (target subsample size was species-dependent) of each of these species was sorted by sex, and individual lengths were measured using Polycorder (Omnidata®) data loggers with barcode readers and barcoded length strips. When recording fish length, the most common measurement used was fork length (FL), however sharks and skates were measured using total length (TL) and giant grenadier were measured from the tip of the snout to the insertion of the anal fin. Fish that could not be readily sexed were classified as unsexed and measured.*
+
+Note the wording "species of commercial value...". Meaning that this was not done for all vertebrate species (understandably). Having a list of what species this info exists for might simplify the decision of how to subset multi-species functional groups to their most representative taxa. 
+```{r}
+lengths <- read.csv("../data/race_length_by_haul.csv", fileEncoding = "UTF-8-BOM", skip = 5)
+cpue <- read.csv("../data/race_cpue_by_haul.csv", skip = 5)
+```
+
+Do this for all species we have length data for (150 or so).
+```{r, fig.width=12}
+all_species <- lengths %>% select(Species.Code, Common.Name) %>% distinct()
+
+diff_hauls <- vector(mode = 'list', length = nrow(all_species))
+diff_hauls_length <- rep(NA, nrow(all_species))
+
+for(i in 1:nrow(all_species)) {
+  this_species <- all_species[i,1]
+  # now subset both catch and length data on this species
+  this_species_catch <- catch %>% filter(Species.Code == this_species)
+  this_species_length <- lengths %>% filter(Species.Code == this_species)
+  
+  # now identify the difference in the hauls between these two
+  hauls_this_species_catch <- levels(factor(this_species_catch$Haul.Join.ID))
+  hauls_this_species_length <- levels(factor(this_species_length$Haul.Join.ID))
+  
+  diff_hauls[[i]] <- setdiff(hauls_this_species_catch, hauls_this_species_length) # store for each species which hauls are present in the catch data but not in the length-frequency data
+  diff_hauls_length[i] <- length(diff_hauls[[i]])
+}
+
+all_species <- all_species %>% mutate(diff_hauls = diff_hauls_length) #%>% arrange(-diff_hauls)
+
+head(all_species %>% arrange(-diff_hauls), 30) # see some
+```
+
+More hauls in the catch set than in the length set, up to a couple thousands for some species. What do these hauls have in common? Let's explore.
+```{r, fig.width=15}
+# check what proportion is hauls with unsatisfactory performance
+catch_diff_hauls <- vector(mode = 'list', length = nrow(all_species))
+
+for(i in 1:length(catch_diff_hauls)) {
+  catch_diff_hauls[[i]] <- catch %>% filter(Haul.Join.ID %in% diff_hauls[[i]] & Species.Code == all_species$Species.Code[i]) %>% group_by(Species.Code, Satisfactory.Gear.Performance) %>% tally()
+}
+
+catch_diff_hauls1 <- do.call(rbind, catch_diff_hauls)
+catch_diff_hauls1 <- catch_diff_hauls1 %>% left_join(all_species, by = "Species.Code")
+
+ggplot()+
+  geom_bar(data = catch_diff_hauls1, aes(x = Common.Name, y = n, fill = Satisfactory.Gear.Performance), stat = "identity", position = "stack")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Some are marked as unsatisfactory hauls in the catch data, but the majority are not. Have a look at the data for an example species, like atf.
+```{r}
+a <- diff_hauls[[which(all_species$Species.Code == 10110)]]
+
+test <- catch %>% filter(Species.Code == 10110, Haul.Join.ID %in% a)
+```
+
+Not obvious. It is possible that length-frequency information is available at the level of station, not haul. Will need to ask about this. 
+
+## Expand zeroes
+
+Catch data only includes hauls with non-zero catch for each species. We need zero catches for sdmTMB.
+
+Use only the catch data here, and see how it compares to the joined data frame - that should help spot issues. We can start from catch_all, which is a joined dataframe of catch and haul sets. 
+
+The zero-inflated catch data is massive, so we need to query one species at a time for things to be more efficient. 
+```{r}
+# rename column names for compact code
+
+catch_all <- catch_all %>% set_names(c("year","haul","catch","lat","lon","depth","species","biom","num"))
+
+# add a column with Atlantis group code and name
+
+key <- race_species %>% select(Species.Code, Atlantis.group, Name)
+catch_all <- catch_all %>% left_join(key, by = c("species" = "Species.Code"))
+
+catch_all <- catch_all %>% filter(!is.na(Name)) # discard those cases that do not map to Atlantis groups
+
+levels(factor(race_species$Name))
+```
+
+Have a look at the data.
+```{r, fig.width = 12, fig.height = 16}
+ggplot(data = catch_all, aes(x = year))+
+  geom_bar(stat = "count")+
+  theme_minimal()+
+  facet_wrap(~Name, scales = "free_y", ncol = 5)
+```
+
+And spatially.
+```{r, fig.width = 10, fig.height=12}
+catch_sf <- catch_all %>% st_as_sf(coords = c(x = "lon", y = "lat"), crs = "WGS84")
+
+race_extent <- extent(catch_sf) # set the extent of the race data
+
+coast <- ne_countries(country = "United States of America", scale = "medium") # pull country ouitlines from Natural Earth
+
+coast <- coast %>% st_as_sf(crs = "WGS84") %>% st_crop(race_extent) # clip it to the extent of the race data
+
+group <- "Dogfish"
+
+ggplot()+
+  geom_sf(data = catch_sf[catch_sf$Name == group,], aes(color = log1p(biom)))+
+  geom_sf(data = coast)+
+  scale_color_viridis()+
+  theme_minimal()+
+  facet_wrap(~year, ncol = 2)
+```
+See text to RACE.Rmd for thoughts about sample sizes of each group and what we should use (those refer to individuals, so for groups like corals and sponges there are fewer data points, but the main ideas hold).
+
+Select which group we want to query,
+```{r}
+group <- "Sablefish"
+```
+
+```{r}
+# add up biomass and num cpue for Atlantis groups instead of species
+catch_atlantis <- catch_all %>% group_by(year,haul,lat,lon,depth,Atlantis.group,Name) %>% summarise(biom = sum(biom), num = sum(num)) %>% ungroup() # this step sums cpue of different species that belong to the same Atlantis group within the same haul - so the number of data points decreases for multi-species groups. Maps should stay the same though.
+
+#length(levels(factor(catch_all$haul))) # check we have not lost hauls
+#length(levels(factor(catch_atlantis$haul)))
+
+# make a data frame with a unique row for each haul. This has to use all hauls
+
+haul.ids <- catch_atlantis %>% select(year,haul,lat,lon,depth) %>% distinct() %>% arrange(haul)
+group.ids <- catch_atlantis %>% select(Atlantis.group, Name) %>% distinct() %>% arrange(Atlantis.group) %>% filter(Name == group)
+
+long.hauls <- haul.ids[rep(seq_len(nrow(haul.ids)), each = nrow(group.ids)),]
+long.groups <- group.ids[rep(seq_len(nrow(group.ids)), nrow(haul.ids)),]      
+
+catch_zeroes <- data.frame(long.hauls, long.groups)
+rm(long.hauls, long.species)
+
+catch_zeroes <- catch_zeroes %>% 
+  rowwise() %>% # change this to purrr::pmap, very inefficient otherwise
+  mutate(biom = ifelse(length(which(catch_atlantis$haul == haul & catch_atlantis$Atlantis.group == Atlantis.group))>0,
+                       catch_atlantis$biom[which(catch_atlantis$haul == haul & catch_atlantis$Atlantis.group == Atlantis.group)], 0),
+         num = ifelse(length(which(catch_atlantis$haul == haul & catch_atlantis$Atlantis.group == Atlantis.group))>0,
+                       catch_atlantis$num[which(catch_atlantis$haul == haul & catch_atlantis$Atlantis.group == Atlantis.group)], 0))
+```
+
+This data frame must have one row per tow. Let's plot it and compare with above. If I remove all zeroes, we should have left what we have above for single-species groups, but fewer data points for multi-species groups.
+```{r, fig.width=8, fig.height=4}
+ggplot(data = catch_zeroes[catch_zeroes$biom>0,], aes(x = year))+
+  geom_bar(stat = "count")+
+  theme_minimal()+
+  labs(title = paste("Non-zero data points for", group, sep = " "))
+```
+
+```{r, fig.width = 10, fig.height=12}
+catch_zeroes_sf <- st_as_sf(catch_zeroes, coords = c(x = "lon", y = "lat"), crs = "WGS84")
+
+ggplot()+
+  geom_sf(data = catch_zeroes_sf, aes(color = log1p(biom)))+
+  geom_sf(data = coast)+
+  scale_color_viridis()+
+  theme_minimal()+
+  facet_wrap(~year, ncol = 2)
+```
+
+So this is CPUE data calculated by me. Things seem to line up with AKFIN's CPUE data for some key species, so the workflow would seem to be sensible

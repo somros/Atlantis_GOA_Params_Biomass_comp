@@ -1,0 +1,252 @@
+---
+title: "Weight make-up of Atlantis multi-species groups"
+author: "Alberto Rovellini"
+date: "6/3/2021"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+This document identifies the species that make up for the biomass of a multi-species group in Atlantis GOA. Examples of multi-species groups are rockfish complexes, gelatinous plankton, and demersal fish. This script works out the species that contribute to 90% of the catch of the group for each year.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = FALSE}
+library(tidyverse)
+library(kableExtra)
+library(sf)
+library(raster)
+library(viridis)
+library(rnaturalearth)
+library(data.table)
+```
+
+```{r}
+select <- dplyr::select
+```
+
+Read in the species data.
+```{r}
+species <- read.csv("../data/Species_codes_downloaded_08Apr2021.csv", fileEncoding="UTF-8-BOM")
+```
+
+Subset to GOA only.
+```{r}
+species_goa <- species %>% filter(In.GOA.Region == "Y")
+```
+
+Save.
+```{r}
+# write.csv(x = species_goa, file = "../data/RACE_species_goa.csv", row.names = FALSE)
+```
+
+# Species codes
+
+Which species belong to each model group?
+
+Read in Atlantis groups, the RACE species list, and map them to one another.
+```{r}
+atlantis_groups <- read.csv("../data/GOA_Groups.csv", fileEncoding = "UTF-8-BOM")
+atlantis_groups <- atlantis_groups %>% select(Code, Name, LongName)
+
+race_species_all <- read.csv("../data/RACE_species_goa_Atlantis_Nov162021.csv", fileEncoding = "UTF-8-BOM")
+race_species <- race_species_all[!is.na(race_species_all$Atlantis.group),] # drop NAs (egg cases, debris, etc.)
+race_species <- race_species %>% select(Atlantis.group:Scientific.Name)
+
+race_species <- race_species %>% left_join(atlantis_groups, by = c("Atlantis.group" = "Code"))
+```
+
+Drop the things that I am still uncertain about. Many of these are "unidentified", so lumping them into any one group may be problematic. We can look at how many of these instances we have, if it is <5% of the data points of the most abundant group that we could map them to, map them there. For example, if "salmon unid." is <5% of the data points for the most abundant salmon group, just dump them in there.
+
+Otherwise randomly allocate them. 
+```{r}
+undecided <- race_species %>% filter(Atlantis.group == "?")
+
+race_species <- race_species %>% filter(Atlantis.group != "?")
+
+paste(undecided$Common.Name, collapse = ", ")
+```
+
+View which species we are missing from the bottom trawl. 
+```{r}
+all_groups <- atlantis_groups$Code
+race_groups <- levels(factor(race_species$Atlantis.group))
+
+missing <- setdiff(all_groups, race_groups)
+
+paste0( "These Atlantis groups do not appear in RACE data: ", atlantis_groups %>% filter(Code %in% missing) %>% select(Name) %>% unlist() %>% paste(collapse = ", "))
+```
+
+Make a table that summarises how we are mapping RACE species records to Atlantis groups.
+```{r}
+species_table <- race_species %>% group_by(Atlantis.group) %>%
+  mutate(Scientific = paste0(Scientific.Name, collapse = ", "),
+         Common = paste0(Common.Name, collapse = ", ")) %>%
+  select(Atlantis.group, LongName:Common) %>%
+  distinct()
+
+# write.csv(species_table, '../data/RACE_species_table_for_methods.csv')
+
+kbl(species_table, col.names = c("Atlantis group code", "Atlantis group name", "RACE scientific name", "RACE common name")) %>%
+  kable_paper(full_width = F) %>%
+  column_spec(1, width = "5em") %>%
+  column_spec(2, width = "5em") %>%
+  column_spec(3, width = "40em") %>%
+  column_spec(4, width = "30em")
+```
+
+# Catch composition of Atlantis groups
+
+Can we identify a subset of the species that contribute the highest biomass to multi-speceis Atlantis groups? Read in catch data from AKFIN.
+```{r, message = FALSE}
+catch <- read.csv("../data/race_catch_by_haul_2021.csv", skip = 5)
+
+# subset to species that have a corresponding Atlantis group (e.g. get rid of egg cases, undetermined, etc.)
+catch <- catch %>% filter(Species.Code %in% race_species$Species.Code)
+
+# join to key with Atlantis groups
+catch_join <- catch %>% left_join(race_species, by = "Species.Code")
+```
+
+## Average by year
+
+Try for one group.
+```{r}
+this_group <- catch_join %>% filter(Atlantis.group == "EUL")
+
+this_group <- this_group %>% 
+  group_by(Atlantis.group, Name, Year, Scientific.Name.x, Common.Name.x) %>% summarize(Weight = sum(Weight..kg., na.rm = TRUE)) %>% 
+  group_by(Year) %>%
+  mutate(Percent_of_weight = Weight/sum(Weight)*100) %>% 
+  ungroup() %>%
+  arrange(Year,desc(Percent_of_weight)) %>% 
+  group_by(Year) %>%
+  mutate(Cumulative = cumsum(Percent_of_weight)) %>%
+  ungroup()
+
+glimpse(this_group)
+```
+
+Subset this to the species that make up 90% of the biomass each year and visualise this.
+```{r}
+# reduce to 90% of the biomass
+this_group_90 <- this_group %>% filter(Cumulative < 95 | Percent_of_weight > 95)
+
+ggplot()+
+  geom_bar(data = this_group_90, aes(x = Year, y = Percent_of_weight, fill = Common.Name.x), stat = "identity", position = "stack")+
+  theme_minimal()
+```
+
+Write a table with this information for each Atlantis group. Pick what cutoff we want, e.g. what is dominant? 90%? 99%? 75%?
+```{r, message = FALSE}
+cutoff <- 90
+
+biomass_makeup <- function(atlantis_group){
+  this_group <- catch_join %>% filter(Atlantis.group == atlantis_group)
+
+  this_group <- this_group %>% 
+    group_by(Atlantis.group, Name, Year, Scientific.Name.x, Common.Name.x) %>% 
+    summarize(Weight = sum(Weight..kg., na.rm = TRUE)) %>% 
+    group_by(Year) %>%
+    mutate(Percent_of_weight = Weight/sum(Weight)*100) %>% 
+    ungroup() %>%
+    arrange(Year,desc(Percent_of_weight)) %>% 
+    group_by(Year) %>%
+    mutate(Cumulative = cumsum(Percent_of_weight)) %>%
+    ungroup() %>%
+    filter(Cumulative<cutoff|Percent_of_weight>cutoff)
+  
+  species_name <- this_group %>% select(Scientific.Name.x) %>% distinct() %>% pull() %>% paste(collapse = ", ", sep = ", ")
+  common_name <- this_group %>% select(Common.Name.x) %>% distinct() %>% pull() %>% paste(collapse = ", ", sep = ", ")
+  
+  this_row <- data.frame(atlantis_group, this_group$Name[1], species_name, common_name)
+  return(this_row)
+}
+
+group_short <- lapply(all_groups, biomass_makeup)
+```
+
+```{r}
+table_short <- rbindlist(group_short)
+table_short[table_short == ""] <- NA
+
+table_short <- table_short %>% na.omit()
+
+kable(table_short, align = 'llll', format = "markdown", 
+      col.names = c("Atlantis group", "Atlantis name", "Species", "Common names"))
+```
+
+## Average over bottom trawl sampling period
+
+Because life history parameters are not dynamic over time, it makes sense to work out which species contribute to the total catch of a group over the entire sampling period. This should also help average out years where a species was particularly abundant.
+
+```{r, message = FALSE}
+this_group <- catch_join %>% filter(Atlantis.group == "DFS")
+
+this_group <- this_group %>% 
+  group_by(Atlantis.group, Name, Scientific.Name.x, Common.Name.x) %>% 
+  summarize(Weight = sum(Weight..kg., na.rm = TRUE)) %>% 
+  ungroup() %>%
+  mutate(Percent_of_weight = Weight/sum(Weight)*100) %>% 
+  arrange(desc(Percent_of_weight)) %>% 
+  mutate(Cumulative = cumsum(Percent_of_weight))
+
+glimpse(this_group)
+```
+
+```{r}
+this_group_90 <- this_group %>% filter(Cumulative < 90 | Percent_of_weight > 90)
+
+ggplot()+
+  geom_bar(data = this_group_90, aes(x = Name, y = Percent_of_weight, fill = Common.Name.x), stat = "identity", position = "stack")+
+  theme_minimal()
+```
+
+This is a considerably shorter list. In terms of finding life history parameters, we could focus on the species that are most abundant in the catch. We could take this one step further and see if we could weight the parameters for some of these species by their appearance in the catch. Do this for all species, and produce a table with the weights. The weights will be recalculated on the catch of the species that make up for 90% of the total catch for the group, all years pooled.
+```{r, message=FALSE}
+cutoff <- 90
+
+biomass_weights <- function(atlantis_group){
+  this_group <- catch_join %>% filter(Atlantis.group == atlantis_group)
+  
+  this_group <- this_group %>% 
+    group_by(Atlantis.group, Name, Scientific.Name.x, Common.Name.x) %>% 
+    summarize(Weight = sum(Weight..kg., na.rm = TRUE)) %>% 
+    ungroup() %>%
+    mutate(Percent_of_weight = Weight/sum(Weight)*100) %>% 
+    arrange(desc(Percent_of_weight)) %>% 
+    mutate(Cumulative = cumsum(Percent_of_weight)) %>% 
+    filter(Cumulative < cutoff | Percent_of_weight > cutoff) %>%
+    select(-Percent_of_weight, -Cumulative) %>%
+    mutate(Prop_weigth = Weight/sum(Weight)) %>% # summing to 1, weights for averaging params (in case we need it)
+    select(-Weight)
+  return(this_group)
+}
+
+group_weights <- lapply(all_groups, biomass_weights)
+```
+
+```{r}
+table_weights <- rbindlist(group_weights)
+colnames(table_weights) <- c("Atlantis_group", "Atlantis_name", "Species", "Common_names", "Weight")
+
+# write out the species list to use n the FishLife script
+write.csv(table_weights %>% distinct(),file="../output/species_90_weights.csv",row.names = FALSE)
+# table_weights[table_weights == ""] <- NA
+
+# table_weights <- table_weights %>% na.omit()
+
+kbl(table_weights, col.names = c("Atlantis group", "Atlantis name", "Species", "Common names", "Weight for parameter avg"), format = "markdown", digits = 2) 
+```
+
+**Note**: Do the weighing of life history parameters on bottom trawl catch can become problematic because catchability varies between species, and catch may not reflect biomass. Weighing would be best done on stock biomasses estimated by stock assessments where available, if done at all. This here however can be useful to see what species have the highest biomass on average, to help focus our parameterization efforts on those species in case of multi-species groups.
+
+Like Hem said, it is likely that LH parameters are available for most abundant species anyway, so to an extent there is an implicit "weighing" occurring based on information available.
+
+# Get weights for individual species
+
+We may get some data, like the estimates of *h*, for species that do not contribute to 0.9 of the biomass of the group. One solution is to discard those, another solution that should yield the same result is to run the same function by group but on the full data set, and species with low biomass should have very low weights. Since we based the parameter search on the species that make up for 90% of the biomass of a functional group, the former option sounds more desirable.

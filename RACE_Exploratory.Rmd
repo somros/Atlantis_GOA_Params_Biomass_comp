@@ -1,0 +1,382 @@
+---
+title: "RACE GAP data viewer"
+author: "Alberto Rovellini"
+date: "4/13/2021"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+Reads in the Species Codes and performs some basic processing.
+
+One of the goals is to understand how many data points we have for each Atlantis functional group from the RACE data as it is available from AKFIN. We are going to encounter a few issues:
+
+1. CPUE data from AKFIN is reported only for 121 selected species. These include all groundfish, salmon, herring, capelin, some crustaceans (prawns), some octopus and squid species, and species of interest for by-catch considerations. Using this data as-is for `sdmTMB` is possible, in principle, for single-species groundfish groups (but keep in mind that we need to apportion the biomass into size bins), and perhaps for some of the complexes like flatfish and rockfish, so long as all species are included in those 121 species, but it will be an approximation for highly-aggregated groups (like "Deep demersal fish" etc.), and not possible at all for any of the benthic invertebrates. This is the description of the CPUE data from AKFIN Answers:
+
+"This file contains derived information from successful survey hauls for the Biennial Bottom Trawl Surveys for the Aleutian Islands (AI), the Gulf of Alaska (GOA), and the Eastern Bering Sea (EBS_SHELF & EBS_SLOPE). For principal species and each survey, the catch per unit effort (cpue) is calculated for each successful haul in terms of weight (kg/km2) and numbers (number/km2). Catch weight and catch number are obtained from catch table information and effort is calculated from haul table information, and is the product of the average opening width of the net at the bridles and the distance fished. Additional information about the survey and haul has been included for convenience. Zero cpues are represented from successful hauls where the principal species was not caught. The methods of calculating cpue can be found in the survey Data Reports that are available in the AFSC Publications tab at this link."
+
+2. The "Catch" data from AKFIN reports caught biomass per haul for 1531/1975 species recorded in the GOA in the RACE surveys so far. Explore where the differences are. This data presents only non-zero catches for each haul. This is the description of the "Catch" data from AKFIN Answers:
+
+"This report contains information about the species that were caught during each RACE haul. Information includes common name, scientific name, RACE species code, total weight, total numbers, and whether a voucher specimen was taken for laboratory identification. Additional information about the survey and haul has been included for convenience."
+
+3. The "Catch" data reports weight and number of individuals per haul, but no measure of the effort of each haul. So, we need to pull haul information from "Haul Descriptions" from AKFIN. 
+4. The CPUE data appears to be calculated for a subset of hauls that met acceptable performance levels. So we may need to subset the final data frame on those hauls only.
+
+__NOTE__: Much of this is based on my interpretation of the AKFIN data products. At this stage the purpose of this is to get an idea of how many data points we have, especially for biomass groups that will not require us to go through Martin/Kirstin for size class apportionment. 
+
+```{r}
+library(tidyverse)
+library(kableExtra)
+library(sf)
+library(raster)
+library(viridis)
+library(rnaturalearth)
+```
+
+```{r}
+select <- dplyr::select
+```
+
+Read in the species data.
+```{r}
+species <- read.csv("../data/Species_codes_downloaded_08Apr2021.csv", fileEncoding="UTF-8-BOM")
+```
+
+Subset to GOA only.
+```{r}
+species_goa <- species %>% filter(In.GOA.Region == "Y")
+```
+
+Save.
+```{r}
+# write.csv(x = species_goa, file = "RACE_species_goa.csv", row.names = FALSE)
+```
+
+# Species codes
+
+Which species belong to each model group?
+
+Read in Atlantis groups, the RACE species list, and map them to one another.
+```{r}
+atlantis_groups <- read.csv("../data/GOA_Groups.csv", fileEncoding = "UTF-8-BOM")
+atlantis_groups <- atlantis_groups %>% select(Code, Name, LongName)
+
+race_species_all <- read.csv("../data/RACE_species_goa_Atlantis.csv", fileEncoding = "UTF-8-BOM")
+race_species <- race_species_all[!is.na(race_species_all$Atlantis.group),] # drop NAs (egg cases, debris, etc.)
+race_species <- race_species %>% select(Atlantis.group:Scientific.Name)
+
+race_species <- race_species %>% left_join(atlantis_groups, by = c("Atlantis.group" = "Code"))
+```
+
+Drop the things that I am still uncertain about. Many of these are "unidentified", so lumping them into any one group may be problematic. We can look at how many of these instances we have, if it is <5% of the data points of the most abundant group that we could map them to, map them there. For example, if "salmon unid." is <5% of the data points for the most abundant salmon group, just dump them in there.
+
+Otherwise randomly allocate them. 
+```{r}
+undecided <- race_species %>% filter(Atlantis.group == "?")
+
+race_species <- race_species %>% filter(Atlantis.group != "?")
+
+paste(undecided$Common.Name, collapse = ", ")
+```
+
+View which species we are missing from the bottom trawl. 
+```{r}
+all_groups <- atlantis_groups$Code
+race_groups <- levels(factor(race_species$Atlantis.group))
+
+missing <- setdiff(all_groups, race_groups)
+
+paste0( "These Atlantis groups do not appear in RACE data: ", atlantis_groups %>% filter(Code %in% missing) %>% select(Name) %>% unlist() %>% paste(collapse = ", "))
+```
+
+Make a table that summarises how we are mapping RACE species records to Atlantis groups.
+```{r}
+species_table <- race_species %>% group_by(Atlantis.group) %>%
+  mutate(Scientific = paste0(Scientific.Name, collapse = ", "),
+         Common = paste0(Common.Name, collapse = ", ")) %>%
+  select(Atlantis.group, LongName:Common) %>%
+  distinct()
+
+kbl(species_table, col.names = c("Atlantis group code", "Atlantis group name", "RACE scientific name", "RACE common name")) %>%
+  kable_paper(full_width = F) %>%
+  column_spec(1, width = "5em") %>%
+  column_spec(2, width = "5em") %>%
+  column_spec(3, width = "40em") %>%
+  column_spec(4, width = "30em")
+```
+
+# View data points
+
+Read in RACE GAP CPE data for all years and all species in the GOA. See the number of data points for each Atlantis group. The matching key here will be the "Species.Code" column in the RACE data. This is just a tally.
+
+There is an important point here. What are the zeroes in this data? Hauls where the species has not been caught. So, they are important in the data. Still, to get a sense of how much data we have here, let's have a look at how many non-zero data points we have for each Atlantis group.
+
+First, define the index.
+```{r}
+key <- race_species %>% select(Atlantis.group, LongName, Species.Code)
+```
+
+```{r}
+cpue <- read.csv("../data/race_cpue_by_haul.csv", skip = 5) # it takes some time, large data set
+```
+
+Select the columns we need. Then join to key. Then tally.
+```{r}
+cpue_points <- cpue %>% select(
+  "Year", 
+  "Starting.Latitude..dd.", 
+  "Starting.Longitude..dd.", 
+  "Bottom.Depth",
+  "Species.Code",
+  "Common.Name",
+  "Weight.CPUE..kg.km2.", 
+  "Number.CPUE..number.km2."
+) %>% group_by(Species.Code, Common.Name) %>% 
+  tally() %>% 
+  ungroup() %>%
+  left_join(key, by = "Species.Code")
+
+glimpse(cpue_points)
+```
+
+So, it appears that the CPUE data only contains info about 121 selected species. Which does not seem to include any of the benthos. What are these species?
+```{r}
+species_121 <- cpue_points %>% select(Species.Code) %>% distinct() %>% left_join(race_species, by = "Species.Code") %>% arrange(Common.Name)
+
+paste(species_121$Common.Name, collapse = ", ")
+```
+
+The Catch data from AKFIN reports catch by haul of all species, including benthos. But that is not standardized by effort. So a merge of the two is what we need. Should be able to join by haul. 
+
+The catch data only includes non-zeroes. So need to do a left join on the CPUE frame. In theory, weights should be the same for caught species for any one haul?
+
+Read in "Catch" data.
+```{r}
+catch <- read.csv("../data/race_catch_by_haul.csv", skip = 5)
+
+# how many species do we have catch data for, from AKFIN?
+length(levels(factor(catch$Species.Code))) # 1531
+
+# and how many hauls?
+length(levels(factor(catch$Haul.Join.ID))) # 12288
+```
+
+The Catch data does not include information about the effort. So let's use the "Haul Description" data set to obtain haul information. The column "Satisfactory Performance" will be used to subset these to the hayuls that can be used.
+```{r}
+hauls <- read.csv("../data/Haul Descriptions.csv", fileEncoding = "UTF-8-BOM")
+hauls <- hauls %>% 
+  select(Haul.Join.ID, Distance.Fished..km., Net.Width..m., Satisfactory.Performance) %>%
+  filter(Satisfactory.Performance == "Y") %>% 
+  mutate(My.effort.km2 = Distance.Fished..km.* Net.Width..m. * 0.001) %>%
+  select(Haul.Join.ID, My.effort.km2)
+```
+
+These are a few hundreds fewer than the number of hauls in the Catch data. That seems to be because the Catch data includes hauls where the gear performance was not satisfactory, but still have caught something. Those would be good enougfh for presence/absence, but we should leave them out for any CPUE calculation.
+
+Now join the haul data to the catch data by Haul.Join.ID. Because now the haul data only contains the hauls we can use for effort/CPUE, join based on that. Drop columns as appropriate. Then calculate new CPUE for weight and numbers from this. Check that this lines up with CPUE as indicated in the CPUE data frame. 
+```{r}
+catch_short <- catch %>% select(Year, Haul.Join.ID, Catch.Join.ID, Starting.Latitude..dd., Starting.Longitude..dd., Bottom.Depth, Species.Code, Weight..kg., Number.of.Fish)
+
+catch_all <- hauls %>% left_join(catch_short) %>% mutate(cpue.kg.km2 = Weight..kg./My.effort.km2, cpue.ind.km2 = Number.of.Fish/My.effort.km2) %>%
+  select(Year, Haul.Join.ID, Catch.Join.ID, Starting.Latitude..dd., Starting.Longitude..dd., Bottom.Depth, Species.Code, cpue.kg.km2, cpue.ind.km2)
+```
+However, some hauls in the haul data do not appear in the catch data. Discard those hauls that do not have information in the catch data.
+
+```{r}
+catch_all <- catch_all %>% filter(!is.na(Starting.Latitude..dd.))
+```
+
+Now join to CPUE data.
+```{r}
+joined <- cpue %>% full_join(catch_all, by = c("Year", "Starting.Latitude..dd.", "Starting.Longitude..dd.", "Bottom.Depth", "Haul.Join.ID", "Catch.Join.ID", "Species.Code"))
+
+# check that things add up
+
+biom <- joined$Weight.CPUE..kg.km2.-joined$cpue.kg.km2
+inds <- joined$Number.CPUE..number.km2.-joined$cpue.ind.km2
+
+head(sort(abs(biom), decreasing = T), 20)
+head(sort(abs(inds), decreasing = T), 20)
+
+# are the records with different biomass cpue and numbers cpue the same?
+setdiff(which(abs(biom)>1e-8), which(abs(inds)>1e-8)) # not quite
+
+levels(factor(joined[which(abs(biom)>1e-8),]$Common.Name))
+levels(factor(joined[which(abs(inds)>1e-8),]$Common.Name))
+
+# clean up
+rm(list = c("cpue", "catch", "hauls"))
+```
+Two issues here. 
+1. CPUE for a couple of skate records differs between the CPUE data set and the Catch data set. 
+2. Some non-zero records from the CPUE data are not present in the Catch data. Let's see if these are some species in particular. 
+
+```{r}
+conflicts <- joined %>% filter(Weight.CPUE..kg.km2. > 0 & is.na(cpue.kg.km2))
+
+conflicting_species <- levels(factor(conflicts$Species.Code))
+
+# see what these are in the species key
+
+race_species[race_species$Species.Code %in% conflicting_species,]$Common.Name
+```
+
+All these conflicts (5722) are on unidentified species (many are the same as the chunk above). These may still be useful to us in terms of Atlantis. Note that all the conflicting records have Catch.Join.ID = 0. I am not sure why these species have a CPUE but not a caught biomass - I suspect it has something to do with data uploading to AKFIN. For now, the solution will be to copy over these CPUE to our CPUE, like below.
+```{r}
+joined1 <- joined %>% rowwise() %>% mutate(cpue.kg.km2 = ifelse(Weight.CPUE..kg.km2. > 0 & is.na(cpue.kg.km2), Weight.CPUE..kg.km2., cpue.kg.km2),
+                                          cpue.ind.km2 = ifelse(Number.CPUE..number.km2. > 0 & is.na(cpue.ind.km2), Number.CPUE..number.km2., cpue.ind.km2))
+rm(joined)
+```
+
+When joining CPUE and Catch data, the weight and numbers columns from the "Catch" data are rich with NAs. That is because the Catch data only includes non-zeroes, while the CPUE data expands those zeroes to all hauls where a species has not been recorded.
+
+Two ways to go now:
+
+## Non-zero data points
+
+This is useful for me to get an idea of how often a group got sampled in the RACE surveys. This may depend on their abundance and catchability with the method, and I am sure there has been plenty of research about it.
+```{r}
+non_zeroes <- joined1 %>% filter(!is.na(cpue.kg.km2))
+
+non_zeroes <- non_zeroes %>% select(Year, Haul.Join.ID, Starting.Latitude..dd., Starting.Longitude..dd., Bottom.Depth, Species.Code, cpue.kg.km2, cpue.ind.km2)
+```
+
+Now join with key and add one column with the Alantis group name.
+```{r}
+non_zeroes <- non_zeroes %>% left_join(race_species, by = "Species.Code") %>% filter(!is.na(Atlantis.group))
+```
+
+Visualise the number of non-zero data points for the Atlantis groups.
+```{r, fig.width = 12, fig.height = 16}
+data_points <- non_zeroes %>% group_by(Name, Year) %>% tally() # this is inds only because of NA omit above!!!
+
+ggplot(data = data_points, aes(x = Year, y = n))+
+  geom_bar(stat = "identity")+
+  theme_minimal()+
+  facet_wrap(~Name, scales = "free_y", ncol = 5)
+```
+
+View in space too. Turn this to sf.
+```{r}
+non_zero_sf <- non_zeroes %>% st_as_sf(coords = c(x = "Starting.Longitude..dd.", "Starting.Latitude..dd."), crs = "WGS84")
+```
+
+View species one at a time as needed (this could become a Shiny App, but is it worth the effort?). 
+```{r, fig.width = 10, fig.height=12}
+race_extent <- extent(non_zero_sf) # set the extent of the race data
+
+coast <- ne_countries(country = "United States of America", scale = "medium") # pull country ouitlines from Natural Earth
+
+coast <- coast %>% st_as_sf(crs = "WGS84") %>% st_crop(race_extent) # clip it to the extent of the race data
+
+group <- "Sponges"
+
+ggplot()+
+  geom_sf(data = non_zero_sf[non_zero_sf$Name == group,], aes(color = log1p(cpue.kg.km2)))+
+  geom_sf(data = coast)+
+  scale_color_viridis()+
+  theme_minimal()+
+  facet_wrap(~Year, ncol = 2)
+```
+Do this for all species.
+```{r, eval=FALSE}
+all_names <- levels(factor(non_zero_sf$Name))
+
+# write a short function that plots out one set of maps for each group
+
+race_plotter <- function(this_group) {
+  p <- ggplot()+
+  geom_sf(data = non_zero_sf[non_zero_sf$Name == this_group,], aes(color = log1p(cpue.kg.km2)))+
+  geom_sf(data = coast)+
+  scale_color_viridis()+
+  theme_minimal()+
+  facet_wrap(~Year, ncol = 2)+
+  labs(title = paste(this_group))
+  ggsave(paste0("../output/maps/", this_group, ".png"), p, width = 10, height = 12)
+}
+
+sapply(all_names, race_plotter)
+```
+
+The data is very sparse for several species, including important ones like salmon. How do we decide which groups can be modelled with sdmTMB and which ones should not? Groups like herring, salmon, plankton, corals, sponges, and any groups where we have better information from other sources, will need to come from said other sources. RACE surveys are designed to sample groundfish. Even octopus is poorly sampled by these surveys. There have been previous SDM efforts in the GOA (EFH to mention one), and there is probably good reason if many opf these species have not been considered in those efforts. 
+
+I think there will need to be a good bit of manually setting abundances and proportions from rough estimations and sparse sources.
+
+The goal here is to identify which groups are *definitely* not possible to model with the RACE data and sdmTMB. A list oif *maybes* would be a good starting point. The final decision will depend on model fit.
+
+While some metric to help me decide "how much data is enough data" would be handy, I think that here we have instances where we can see that the RACE data is not appropriate to model biomass distributions right off the bat. These include:
+
+1. Corals*
+2. King crab
+3. Euphausiids
+4. Herring
+5. Macrozooplankton
+6. Meiobenthos
+7. All salmon (Chinook, pink, coho, chum, sockeye)
+8. Sandlance**
+9. Pelagic sharks
+10. Demersal sharks
+
+-* There may be better data for these, see if Jodi gets back to us.
+-** These might need to go with other groups if we cannot parameterize them appropriately dues to data limitations.
+
+For most of these, they simply are not caught with the RACE methodology, either because they are pelagic (for example, Euphausiids, etc.) or infauna (meiobenthos, sandlance). In general, pelagic species won't be captured very well in the RACE data. Some of these are important species with their own stock assessments, like herring, salmon, and king crab, and we may be able to find informaiton there. 
+
+At the other end, we have some groups that we have lots of data points for. For these groups, an sdmTMB approach may seem appropriate. However, some of these are covered in the EFH work. Furthermore, model convergence, fit, and skill will be used to decide whether the approach is appropriate. These groups include:
+
+1. Arrowtooth flounder*
+2. Bivalves
+3. Pacific cod*
+4. Other crabs
+5. Tanner crab
+6. Deep demersal fish
+7. Deposit feeders
+8. Dogfish
+9. Epibenthic carnivores
+10. Epibenthic grazers
+11. Filter feeders
+12. Flatfish deep*
+13. Flatfish shallow**
+14. Flathead sole*
+15. Forage shelf
+16. Halibut
+17. Jellyfish
+18. POP*
+19. Pollock*
+20. Rex sole*
+21. Rockfish demersal shelf**
+22. Rockfish pelagic shelf**
+23. Rockfish slope**
+24. Sablefish*
+25. Sculpins
+26. Shallow demersal***
+27. Shrimp other
+28. Shrimp pandalid
+29. Other skate
+30. Longnose skate
+31. Squid
+32. Thornyhead*
+
+-* = EFH
+-** = EFH but with different aggregation
+-*** = EFH for Atka mackerel only
+
+All these are probably well worth a shot with sdmTMB. Note that in most of these cases what makes for a larger sample size is the level of aggregation. For Epibenthic carnivores, for example, those points come from pooling a large number of species together (see table at the beginning of this document). 
+
+In between these, there are a few groups that look quite sparse, but may be worth a shot if what we need are *coarse* distributions and biomass values. These include:
+
+1. Benthic carnivores
+2. Capelin
+3. Forage slope
+4. Other gelatinous plankton
+5. Octopus
+6. Big skate
+7. Sponges*
+
+-* See corals, probably there are better data sources.
+
+TODO:
+
+Think about the problem with zeroes. Probably the best course of action is to use the hauls from the Haul Description data set as a master list of all hauls, and the RACE species list in the GOA as a master list of all species that we should consider. Then we label a species as "0" in every haul where that species was not caught. Then we apply sdmTMB to the CPUE as caculated by me from the catch data (only to those species that we have enough data points for).
